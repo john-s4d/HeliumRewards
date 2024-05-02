@@ -1,44 +1,53 @@
-﻿using CoinGecko.Clients;
-using CoinGecko.Interfaces;
-using System.Net;
+﻿using RestSharp;
+using Microsoft.Extensions.Configuration;
 
 namespace HeliumRewards
 {
     internal class CoinGecko
     {
-        private readonly ICoinGeckoClient _client;
-        private const int DELAY = 10000;        
+        private readonly RestClient _client;
+        private readonly string _apiKey;
+        private const int BACKOFF_DELAY = 10000;
 
         internal CoinGecko()
         {
-            _client = CoinGeckoClient.Instance;
+            var builder = new ConfigurationBuilder()
+               .SetBasePath(Directory.GetCurrentDirectory())
+               .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+               .AddUserSecrets<Program>();
+
+            var configuration = builder.Build();
+            _apiKey = configuration["CoinGeckoApiKey"];
+            
+            var options = new RestClientOptions("https://api.coingecko.com/api/v3/")
+            {
+                MaxTimeout = 10000
+            };
+            _client = new RestClient(options);
+                        
+            _client.AddDefaultHeader("accept", "application/json");
         }
 
         internal decimal? CoinHistory(string coinId, DateTime date, string currency)
-        {   
-            while (true)
+        {
+            var request = new RestRequest($"coins/{coinId}/history", Method.Get);
+            request.AddQueryParameter("date", date.ToString("dd-MM-yyyy"));
+            request.AddQueryParameter("x-cg-demo-api-key", $"{_apiKey}");
+
+            try
             {
-                try
+                var response = _client.GetAsync<dynamic>(request).Result;
+                if (response.MarketData.CurrentPrice.TryGetValue(currency, out decimal price))
                 {
-                    var result = _client.CoinsClient.GetHistoryByCoinId(coinId, date.ToString("dd-MM-yyyy"), "false").Result;
-
-                    if (result.MarketData.CurrentPrice.ContainsKey(currency))
-                    {
-                        return result.MarketData.CurrentPrice[currency];
-                    }
-
-                    return null;
+                    return Convert.ToDecimal(price);
                 }
-                catch (AggregateException ex)
-                {
-                    if ((ex.InnerException as HttpRequestException)?.StatusCode == HttpStatusCode.TooManyRequests)
-                    {
-                        Console.WriteLine($"CoinGecko TooManyRequests. Sleeping {DELAY}ms");
-                        Thread.Sleep(DELAY);                        
-                        continue;
-                    }
-                    throw;
-                }
+                return null;
+            }
+            catch (Exception ex) when (ex.InnerException is HttpRequestException { StatusCode: System.Net.HttpStatusCode.TooManyRequests })
+            {
+                Console.WriteLine($"Rate limit exceeded, retrying after {BACKOFF_DELAY} milliseconds...");
+                Task.Delay(BACKOFF_DELAY);
+                return CoinHistory(coinId, date, currency);  // Recursive retry
             }
         }
     }

@@ -1,15 +1,18 @@
-﻿using HeliumDotNet;
+﻿using System.Globalization;
 
 namespace HeliumRewards
 {
     internal class Program
     {
-        static readonly DateTime DEFAULT_START = DateTime.Today;
-        static readonly DateTime DEFAULT_END = DateTime.Today;
-        static readonly string? DEFAULT_INPUT_FILENAME = null;
-        static readonly string DEFAULT_OUTPUT_FILENAME = "output.csv";
-        static readonly string DEFAULT_TOTAL_AS = "day";
-        static readonly string DEFAULT_CURRENCY = "usd";
+        private static readonly DateTime DEFAULT_START_TIME = DateTime.Today;
+        private static readonly DateTime DEFAULT_END_TIME = DateTime.Today;
+        private const string DEFAULT_INPUT_FILENAME = "input.csv";
+        private const string DEFAULT_OUTPUT_FILENAME = "output.csv";
+        private const string DEFAULT_AGGREGATE_PERIOD = "month";
+        private const string DEFAULT_CURRENCY = "cad";
+        private const string DEFAULT_EXCHANGE_RATE_CACHE = "exchange-rates.csv";
+
+        private static Dictionary<string, Dictionary<DateTime, decimal>> _exchangeRates = new();
 
         static void Main(string[] args)
         {
@@ -23,114 +26,35 @@ namespace HeliumRewards
                     return;
                 }
 
-                DateTime start = parameters.ContainsKey("s") ? DateTime.Parse(parameters["s"]) : DEFAULT_START; // TODO: Adjust for UTC
-                DateTime end = parameters.ContainsKey("e") ? DateTime.Parse(parameters["e"]) : DEFAULT_END; // TODO: Adjust for UTC
-                string? inputFileName = parameters.ContainsKey("i") ? parameters["i"] : DEFAULT_INPUT_FILENAME;
+                DateTime start = parameters.ContainsKey("s") ? DateTime.Parse(parameters["s"]) : DEFAULT_START_TIME;
+                DateTime end = parameters.ContainsKey("e") ? DateTime.Parse(parameters["e"]) : DEFAULT_END_TIME;
+                string inputFileName = parameters.ContainsKey("i") ? parameters["i"] : DEFAULT_INPUT_FILENAME;
                 string outputFileName = parameters.ContainsKey("o") ? parameters["o"] : DEFAULT_OUTPUT_FILENAME;
-                string totalAs = parameters.ContainsKey("t") ? parameters["t"] : DEFAULT_TOTAL_AS; // TODO: Enum & Validate
-                string currency = parameters.ContainsKey("c") ? parameters["c"] : DEFAULT_CURRENCY; // TODO: lowercase, validate valid currency?
+                string aggregatePeriod = parameters.ContainsKey("p") ? parameters["p"] : DEFAULT_AGGREGATE_PERIOD;
+                string currency = parameters.ContainsKey("c") ? parameters["c"] : DEFAULT_CURRENCY;
+                string exchangeRateCacheFileName = parameters.ContainsKey("x") ? parameters["x"] : DEFAULT_EXCHANGE_RATE_CACHE;
 
-                List<string> minerNamesAndAddresses;
-
-                if (inputFileName == null)
+                if (!File.Exists(inputFileName))
                 {
-                    Console.WriteLine("Input file not specified.");
+                    Console.WriteLine($"Input file does not exist: {inputFileName}");
                     ShowHelp();
                     return;
                 }
-                else
+
+                if (!File.Exists(exchangeRateCacheFileName))
                 {
-                    minerNamesAndAddresses = File.Exists(inputFileName) ? File.ReadAllLines(inputFileName).ToList() : throw new FileNotFoundException($"Unable to find file at path: {inputFileName}");
+                    Console.WriteLine($"Exchange rate cache file does not exist: {exchangeRateCacheFileName}");
+                    ShowHelp();
+                    return;
                 }
+                
+                _exchangeRates = LoadExchangeRates(exchangeRateCacheFileName);
 
-                HeliumApi helium = new HeliumApi();
-                CoinGecko coinGecko = new CoinGecko();
-
-                Dictionary<DateTime, decimal> exchangeRates = new Dictionary<DateTime, decimal>();
-                Dictionary<string, Dictionary<DateTime, decimal>> rowData = new Dictionary<string, Dictionary<DateTime, decimal>>();
-
-                foreach (string minerRecord in minerNamesAndAddresses)
-                {
-                    // Records are provided in the form of "name,address"
-                    // This isn't normalized, but name can be associated to multiple addresses so we need to be sure we have the right address.
-
-                    var minerDetails = minerRecord.Split(",");
-                    string name = minerDetails[0];
-                    string address = minerDetails[1];
-
-                    // FIXME: Helium API uses end date exclusive, so the last day is missing. Need to adjust end DateTime to next day.
-                    // FIXME: Also need to adjust for Daylight Savings & UTC.
-
-                    // Always gather rewards and exchange rates on a daily basis
-                    List<RewardSum> rewards = helium.RewardTotalForHotspot(address, start.ToString("o"), end.ToString("o"), "day");
-
-                    rowData.Add(name, new Dictionary<DateTime, decimal>());
-
-                    foreach (RewardSum data in rewards)
-                    {
-                        if (!exchangeRates.ContainsKey(data.Timestamp))
-                        {
-                            exchangeRates.Add(data.Timestamp, coinGecko.CoinHistory("helium", data.Timestamp, currency) ?? throw new ArgumentNullException($"Currency {currency} not found."));
-                        }
-
-                        rowData[name].Add(data.Timestamp, data.Total * exchangeRates[data.Timestamp]);
-
-                        Console.WriteLine($"{data.Timestamp} : {name} : {data.Total} : {exchangeRates[data.Timestamp]}");
-                    }
-                }
-
-                // Now sum it up into the required totalAs bucket
-
-                foreach (string miner in rowData.Keys)
-                {
-                    switch (totalAs)
-                    {
-                        case "day":
-                            rowData[miner] = rowData[miner].GroupBy(x => x.Key.Date).ToDictionary(g => g.Key, g => g.Sum(x => x.Value));
-                            break;
-                        case "month":
-                            rowData[miner] = rowData[miner].GroupBy(x => new DateTime(x.Key.Year, x.Key.Month, 1)).ToDictionary(g => g.Key, g => g.Sum(x => x.Value));
-                            break;
-                        case "year":
-                            rowData[miner] = rowData[miner].GroupBy(x => new DateTime(x.Key.Year, 1, 1)).ToDictionary(g => g.Key, g => g.Sum(x => x.Value));
-                            break;
-                    }
-                }
-
-                // Prepare for CSV
-
-                List<string[]> csvData = new List<string[]>();
-
-                // Create header row
-                string[] headerRow = new string[rowData.Values.First().Count + 1];
-                headerRow[0] = "";
-                int i = 1;
-                foreach (KeyValuePair<DateTime, decimal> innerPair in rowData.Values.First())
-                {
-                    headerRow[i] = innerPair.Key.ToString();
-                    i++;
-                }
-                csvData.Add(headerRow);
-
-                // Create data rows
-                foreach (KeyValuePair<string, Dictionary<DateTime, decimal>> outerPair in rowData)
-                {
-                    string[] csvRow = new string[outerPair.Value.Count + 1];
-                    csvRow[0] = outerPair.Key;
-                    i = 1;
-                    foreach (KeyValuePair<DateTime, decimal> innerPair in outerPair.Value)
-                    {
-                        csvRow[i] = innerPair.Value.ToString();
-                        i++;
-                    }
-                    csvData.Add(csvRow);
-                }
-
-                WriteToCSV(outputFileName, csvData);
-
+                ProcessCSV(inputFileName, outputFileName, start, end, currency, aggregatePeriod, exchangeRateCacheFileName);
             }
             catch (ArgumentException ex)
             {
+                Console.WriteLine(ex.Message);
                 ShowHelp();
             }
             catch (Exception ex)
@@ -140,45 +64,171 @@ namespace HeliumRewards
             }
         }
 
-        private static void WriteToCSV(string filePath, List<string[]> data)
+        class RewardRecord
         {
-            using (StreamWriter sw = new StreamWriter(filePath))
+            public string HotspotId { get; set; } = string.Empty;
+            public string HotspotName { get; set; } = string.Empty;
+            public string TokenType { get; set; } = string.Empty;
+            public DateTime StartTimestamp { get; set; }
+            public DateTime EndTimestamp { get; set; }
+            public decimal Amount { get; set; }
+        }
+
+        private static void ProcessCSV(string inputFileName, string outputFileName, DateTime start, DateTime end, string currency, string aggregatePeriod, string exchangeRateCacheFileName)
+        {
+            var rewardRecords = new List<RewardRecord>();
+
+            foreach (var line in File.ReadAllLines(inputFileName).Skip(1))
             {
-                foreach (string[] row in data)
+                try
                 {
-                    string line = string.Join(",", row);
-                    sw.WriteLine(line);
+                    var parts = line.Split(',');
+
+                    if (parts.Length != 6)
+                    {
+                        continue;
+                    }
+
+                    var startTimestamp = DateTimeOffset.FromUnixTimeSeconds(long.Parse(parts[3].Trim())).DateTime;
+                    var endTimestamp = DateTimeOffset.FromUnixTimeSeconds(long.Parse(parts[4].Trim())).DateTime;
+
+                    if (startTimestamp >= start && endTimestamp <= end)
+                    {
+                        rewardRecords.Add(new RewardRecord
+                        {
+                            HotspotId = parts[0],
+                            HotspotName = parts[1],
+                            TokenType = parts[2],
+                            StartTimestamp = startTimestamp,
+                            EndTimestamp = endTimestamp,
+                            Amount = decimal.Parse(parts[5], NumberStyles.Float, CultureInfo.InvariantCulture)
+                        });
+                    }
+                }
+                catch (FormatException)
+                {
+                    Console.WriteLine($"Format Exception in Line: {line}");
+                    throw;
                 }
             }
+
+            var groupedData = GroupDataByPeriod(rewardRecords, aggregatePeriod, currency, exchangeRateCacheFileName);
+            WriteAggregatedToCSV(outputFileName, groupedData, aggregatePeriod);
         }
 
-        private static void ShowHelp()
+        private static Dictionary<string, Dictionary<DateTime, decimal>> GroupDataByPeriod(List<RewardRecord> data, string period, string currency, string exchangeRateCacheFileName)
         {
-            Console.WriteLine("Could not parse args. Valid format is:");
-            Console.WriteLine("-s start_date [MM-dd-yyyy]\r\n-e end_date [MM-dd-yyyy]\r\n-i input_file_name\r\n-o output_file_name\r\n-t total_as (day|month|year)\r\n-c currency");
-            Console.WriteLine("Rewards are reported daily using that day's exchange rate.");
-        }
+            var result = new Dictionary<string, Dictionary<DateTime, decimal>>();
 
-
-        private static Dictionary<string, string> ParseArgs(string[] args)
-        {
-            Dictionary<string, string> result = new Dictionary<string, string>();
-
-            for (int i = 0; i < args.Length - 1; i = i + 2)
+            foreach (var record in data)
             {
-                if (args[i].StartsWith("-"))
-                {
-                    // TODO: Args can only be in the set: s,e,i,o,t,c
+                decimal exchangeRate = GetExchangeRate(record.EndTimestamp.Date, currency, record.TokenType, exchangeRateCacheFileName);
 
-                    result.Add(args[i].Substring(1), args[i + 1]);
-                }
-                else
+                if (exchangeRate <= 0)
                 {
-                    throw new ArgumentException();
+                    throw new Exception($"Invalid exchange rate for record: {record.HotspotName} {record.EndTimestamp}");
                 }
+
+                DateTime periodKey = DeterminePeriodKey(record.EndTimestamp, period);
+
+                if (!result.ContainsKey(record.HotspotName))
+                {
+                    result[record.HotspotName] = new Dictionary<DateTime, decimal>();
+                }
+
+                if (!result[record.HotspotName].ContainsKey(periodKey))
+                {
+                    result[record.HotspotName][periodKey] = 0;
+                }
+
+                result[record.HotspotName][periodKey] += record.Amount * exchangeRate;
             }
 
             return result;
         }
+
+        private static DateTime DeterminePeriodKey(DateTime date, string period)
+        {
+            switch (period.ToLower())
+            {
+                case "day":
+                    return new DateTime(date.Year, date.Month, date.Day);
+                case "month":
+                    return new DateTime(date.Year, date.Month, 1);
+                case "year":
+                    return new DateTime(date.Year, 1, 1);
+                default:
+                    throw new ArgumentException("Invalid period type.");
+            }
+        }
+
+        private static Dictionary<string, Dictionary<DateTime, decimal>> LoadExchangeRates(string fileName)
+        {
+            var rates = new Dictionary<string, Dictionary<DateTime, decimal>>();
+            foreach (var line in File.ReadAllLines(fileName).Skip(1))
+            {
+                var parts = line.Split(',');
+                var date = DateTime.ParseExact(parts[0], "yyyy-MM-dd", CultureInfo.InvariantCulture);
+                var iotCadRate = decimal.Parse(parts[1]);
+                var hntCadRate = decimal.Parse(parts[2]);
+
+                if (!rates.ContainsKey("iot-cad"))
+                    rates["iot-cad"] = new Dictionary<DateTime, decimal>();
+                if (!rates.ContainsKey("hnt-cad"))
+                    rates["hnt-cad"] = new Dictionary<DateTime, decimal>();
+
+                rates["iot-cad"][date] = iotCadRate;
+                rates["hnt-cad"][date] = hntCadRate;
+            }
+            return rates;
+        }
+
+        private static decimal GetExchangeRate(DateTime date, string currency, string tokenType, string exchangeRateCacheFileName)
+        {
+            string cacheKey = $"{tokenType.ToLower()}-{currency.ToLower()}";
+            if (_exchangeRates.ContainsKey(cacheKey) && _exchangeRates[cacheKey].ContainsKey(date))
+            {
+                return _exchangeRates[cacheKey][date];
+            }
+            throw new Exception("Exchange rate not found for the given date and token type.");
+        }
+
+        private static void WriteAggregatedToCSV(string filePath, Dictionary<string, Dictionary<DateTime, decimal>> data, string totalAs)
+        {
+            var periods = data.SelectMany(d => d.Value.Keys).Distinct().OrderBy(x => x).ToList();
+            using (StreamWriter sw = new StreamWriter(filePath))
+            {
+                sw.WriteLine($"Hotspot Name,{string.Join(",", periods.Select(p => p.ToString(totalAs == "month" ? "yyyy-MM" : "yyyy-MM-dd")))}");
+                foreach (var entry in data)
+                {
+                    sw.WriteLine($"{entry.Key},{string.Join(",", periods.Select(p => entry.Value.TryGetValue(p, out var amount) ? amount.ToString(CultureInfo.InvariantCulture) : "0"))}");
+                }
+            }
+        }
+
+        private static Dictionary<string, string> ParseArgs(string[] args)
+        {
+            var result = new Dictionary<string, string>();
+            for (int i = 0; i < args.Length - 1; i += 2)
+            {
+                if (args[i].StartsWith("-"))
+                {
+                    result.Add(args[i].Substring(1), args[i + 1]);
+                }
+                else
+                {
+                    throw new ArgumentException("Invalid argument format");
+                }
+            }
+            return result;
+        }
+
+        private static void ShowHelp()
+        {
+            Console.WriteLine("Usage:");
+            Console.WriteLine("-s start_date [MM-dd-yyyy] -e end_date [MM-dd-yyyy] -i input_file_name -o output_file_name -p aggregate_period (day|month|year) -c currency -x exchange_rate_cache_filename");
+            Console.WriteLine("Example: -s 01/01/2023 -e 01/01/2024 -p month -i input.csv -o output.csv -c cad -x exchange-rates.csv");
+        }
+
     }
 }
